@@ -2,15 +2,62 @@ const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, PermissionsB
 const { token } = require('./config.json');
 const fs = require("fs");
 const moment = require("moment-timezone");
+const path = require("path");
 
 // File paths
 const countdownsFile = "./countdowns.json";
 const hostersFile = "./hosters.json";
+const sessionHostersFile = "./sessionHosters.json";
+
+function loadSessionHosters() {
+  if (fs.existsSync(sessionHostersFile)) {
+    return JSON.parse(fs.readFileSync(sessionHostersFile, "utf8"));
+  }
+  return {};
+}
+
+function saveSessionHosters() {
+  fs.writeFileSync(sessionHostersFile, JSON.stringify(sessionHosters, null, 2));
+}
+
+let sessionHosters = loadSessionHosters();
+
+const sessionsFile = "./sessions.json";
+
+function loadSessions() {
+  if (fs.existsSync(sessionsFile)) {
+    return JSON.parse(fs.readFileSync(sessionsFile, "utf8"));
+  }
+  return {};
+}
+
+function saveSessions() {
+  fs.writeFileSync(sessionsFile, JSON.stringify(sessions, null, 2));
+}
+
+// sessions keyed by userId
+let sessions = loadSessions();
+
+
 
 // Allowed farm channels
-const FARM_CHANNELS = new Set(["lf1","lf2","lf3","lf4","lf5"]);
-const isFarmChannel = (ch) => ch && FARM_CHANNELS.has((ch.name || "").toLowerCase());
+// Allowed farm channels: lord-farm-1 → lord-farm-10
+const isFarmChannel = (ch) => {
+  if (!ch || !ch.name) return false;
+  const name = ch.name.toLowerCase().replace("⚡┃", "");
+  return /^lord-farm-(?:[1-9]|10)$/.test(name);
+};
 
+const balancesPath = path.join(__dirname, "balances.json");
+let balances = {};
+
+if (fs.existsSync(balancesPath)) {
+  balances = JSON.parse(fs.readFileSync(balancesPath, "utf8"));
+}
+
+function saveBalances() {
+  fs.writeFileSync(balancesPath, JSON.stringify(balances, null, 2));
+}
 
 // Load JSON safely
 function loadJSON(path) {
@@ -24,7 +71,7 @@ function saveJSON(path, data) {
 // Globals
 let countdowns = loadJSON(countdownsFile);
 let hosters = loadJSON(hostersFile);
-
+let countdownTimers = {}; // store active timers
 // Save helpers
 function saveCountdowns() {
   saveJSON(countdownsFile, countdowns);
@@ -54,9 +101,35 @@ client.once("ready", () => {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
+  // Time Commands
+  const restrictedRoles = [
+    1408951460984782909,    // replace with real ID
+    1408951531381723236, // replace with real ID
+    1408951564965646447    // replace with real ID
+  ];
 
-  // Time Command
-  if (message.content.toLowerCase() === "!time") {
+  // Only apply restriction if the user does NOT have ViewAuditLog permission
+  if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    if (message.mentions.roles.size > 0) {
+      const restrictedMention = message.mentions.roles.find(role =>
+        role.name === "duelist" || role.name === "strategist" || role.name === "vanguard"
+      );
+      if (restrictedMention && message.channel.name !== "lf-lord-farm") {
+        try {
+          await message.delete();
+          await message.channel.send(
+            `⚠️ ${message.author}, you can only ping **${restrictedMention.name}** in **#lf-lord-farm**.`
+          );
+        } catch (err) {
+          console.error("Failed to delete restricted ping:", err);
+        }
+        return; // stop here so commands don't trigger
+      }
+    }
+  }
+  
+  
+  if (message.content.toLowerCase() === "?time") {
     const times = {
       "🇧🇷 São Paulo": moment().tz("America/Sao_Paulo").format("HH:mm:ss"),
       "🇸🇦 Dammam": moment().tz("Asia/Riyadh").format("HH:mm:ss"),
@@ -84,15 +157,18 @@ client.on("messageCreate", async (message) => {
   }
 
   // Countdown Commands
-  if (message.content.toLowerCase() === "!countdown") {
+  if (message.content.toLowerCase() === "?countdown") {
     const channelId = message.channel.id;
 
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
+      return message.reply("❌ Do not have the permission to start a farm");
+    }
     if (!isFarmChannel(message.channel)) {
-      return message.reply("⚠️ You can only start countdowns in #lf1–#lf5.");
+      return message.reply("⚠️ You can only start farm countdowns in #lord-farm-1 to #lord-farm-10");
     }
 
     if (countdowns[channelId]) {
-      return message.reply("⚠️ A countdown is already active in this channel.");
+      return message.reply("⚠️ A farm is already active in this channel.");
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -123,23 +199,22 @@ client.on("messageCreate", async (message) => {
 
     const sentMsg = await message.reply({ embeds: [embed] });
 
-    // Auto end after 1h
-    setTimeout(() => {
+    countdownTimers[channelId] = setTimeout(() => {
       if (countdowns[channelId]) {
         endCountdown(channelId, client, sentMsg);
       }
-    }, 3600000);
+    }, 10000);
 
     logAction(client, `⏳ Farm started in <#${channelId}> by **${authorName}**.`);
   }
-  if (message.content.toLowerCase() === "!status") {
+  if (message.content.toLowerCase() === "?status") {
     if (Object.keys(countdowns).length === 0) {
-      return message.reply("✅ No active countdowns.");
+      return message.reply("✅ No active farms.");
     }
 
     const embed = new EmbedBuilder()
       .setColor(0x00ff7f)
-      .setTitle("⏳ Active Countdowns")
+      .setTitle("⏳ Active farms")
       .setTimestamp();
 
     for (const [channelId, data] of Object.entries(countdowns)) {
@@ -152,10 +227,13 @@ client.on("messageCreate", async (message) => {
 
     await message.reply({ embeds: [embed] });
   }
-  if (message.content.toLowerCase() === "!endcountdown") {
+  if (message.content.toLowerCase() === "?endcountdown") {
     const channelId = message.channel.id;
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
+      return message.reply("❌ Do not have the permission to end a farm");
+    }
     if (!isFarmChannel(message.channel)) {
-      return message.reply("⚠️ You can only end countdowns in #lf1–#lf5.");
+      return message.reply("⚠️ You can only end countdowns in #lord-farm-1 to #lord-farm-10");
     }
     if (!countdowns[channelId]) {
       return message.reply("⚠️ No active countdown in this channel.");
@@ -163,8 +241,8 @@ client.on("messageCreate", async (message) => {
     await endCountdown(channelId, client, message);
   }
 
-  // Leaderboard Commands
-  if (message.content.toLowerCase() === "!resetleaderboard") {
+  // Leaderboard Commands/
+  if (message.content.toLowerCase() === "?resetleaderboard") {
     if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
       return message.reply("❌ Only admins can reset the leaderboard.");
     }
@@ -173,7 +251,7 @@ client.on("messageCreate", async (message) => {
     message.reply("✅ Leaderboard has been reset.");
     logAction(client, `🗑️ Leaderboard was reset by **${message.author.username}**.`);
   }
-  if (message.content.toLowerCase() === "!leaderboard") {
+  if (message.content.toLowerCase() === "?leaderboard") {
   const entries = Object.entries(hosters);
 
   if (entries.length === 0) {
@@ -214,9 +292,193 @@ client.on("messageCreate", async (message) => {
   await message.reply({ embeds: [embed] });
   }
 
+  // Money Commands
+  // add money (admin only)
+  if (message.content.toLowerCase().startsWith("?pay")) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return message.reply("❌ You do not have permission to use this command.");
+    }
+  
+    const args = message.content.trim().split(/ +/).slice(1);
+    const user = message.mentions.users.first();
+    const amount = parseFloat(args[1]);
+  
+    if (!user || isNaN(amount)) {
+      return message.reply("❌ Usage: `!addmoney @user <amount>`");
+    }
+  
+    if (!balances[user.id]) balances[user.id] = { balance: 0 };
+    balances[user.id].balance += amount;
+    saveBalances();
+  
+    message.channel.send(`💰 Added **$${amount.toFixed(2)}** to ${user.username}'s account. New balance: **$${balances[user.id].balance.toFixed(2)}**`);
+  }
+  // Subtract money (admin only)
+  if (message.content.toLowerCase().startsWith("?paid")) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return message.reply("❌ You do not have permission to use this command.");
+    }
+  
+    const args = message.content.trim().split(/ +/).slice(1);
+    const user = message.mentions.users.first();
+    const amount = parseFloat(args[1]);
+  
+    if (!user || isNaN(amount)) {
+      return message.reply("❌ Usage: `!pay @user <amount>`");
+    }
+  
+    if (!balances[user.id]) balances[user.id] = { balance: 0 };
+    balances[user.id].balance -= amount;
+    saveBalances();
+  
+    message.channel.send(`💸 Subtracted **$${amount.toFixed(2)}** from ${user.username}'s account. New balance: **$${balances[user.id].balance.toFixed(2)}**`);
+  }
+  // Check balance (admin can check anyone, users can only check their own)
+  if (message.content.toLowerCase().startsWith("!balance")) {
+    const args = message.content.trim().split(/ +/).slice(1);
+    let user = message.mentions.users.first() || message.author;
+  
+    if (user.id !== message.author.id && !message.member.permissions.has("ADMINISTRATOR")) {
+      return message.reply("❌ You can only check your own balance.");
+    }
+  
+    if (!balances[user.id]) balances[user.id] = { balance: 0 };
+  
+    message.channel.send(`💳 Balance for **${user.username}**: **$${balances[user.id].balance.toFixed(2)}**`);
+  }
+  if (message.content.toLowerCase() === "?ledger") {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return message.reply("❌ Only admins can view the ledger.");
+    }
+
+    if (Object.keys(balances).length === 0) {
+      return message.reply("📒 The ledger is empty. No balances found.");
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x3498db)
+      .setTitle("📒 Full Ledger")
+      .setDescription("List of all balances stored in the system:")
+      .setTimestamp();
+
+    for (const [userId, data] of Object.entries(balances)) {
+      try {
+        const user = await message.client.users.fetch(userId); // fetch user by ID
+        embed.addFields({
+        name: user.tag, // DiscordTag (e.g., MyUser#1234)
+        value: `$${(data.balance ?? 0).toFixed(2)}`,
+        inline: true
+        });
+      } catch (err) {
+      // Fallback in case user can't be fetched (e.g. left server)
+      embed.addFields({
+        name: `Unknown User (${userId})`,
+        value: `$${(data.balance ?? 0).toFixed(2)}`,
+        inline: true
+      });
+    }
+  }
+
+  await message.reply({ embeds: [embed] });
+}
+
+  // Session commands
+  if (message.content.toLowerCase() === "?session") {
+    const userId = message.author.id;
+  
+    if (sessions[userId]) {
+      return message.reply("⚠️ You already have an active session. Use `!endsession` first.");
+    }
+  
+    const start = Math.floor(Date.now() / 1000);
+  
+    sessions[userId] = {
+      startTime: start,
+      authorName: message.author.username,
+    };
+    saveSessions();
+  
+    const embed = new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle("🟢 Session Started")
+      .setDescription(
+        `Session started at <t:${start}:t>\n` +
+        `Started by: **${message.author.username}**`
+      )
+      .setTimestamp();
+  
+    await message.reply({ embeds: [embed] });
+  }
+
+  if (message.content.toLowerCase() === "?endsession") {
+    const userId = message.author.id;
+  
+    if (!sessions[userId]) {
+      return message.reply("⚠️ You don't have an active session to end.");
+    }
+  
+    const session = sessions[userId];
+    const end = Math.floor(Date.now() / 1000);
+    const elapsedSeconds = end - session.startTime;
+    const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  
+    // Update session leaderboard
+    if (!sessionHosters[userId]) {
+      sessionHosters[userId] = { tag: session.authorName, count: 0, time: 0 };
+    }
+    sessionHosters[userId].count += 1;
+    sessionHosters[userId].time += elapsedMinutes;
+    saveSessionHosters();
+  
+    delete sessions[userId];
+    saveSessions();
+  
+    const embed = new EmbedBuilder()
+      .setColor(0xe74c3c)
+      .setTitle("🔴 Session Ended")
+      .setDescription(
+        `Started by: **${session.authorName}**\n` +
+        `Duration: **${elapsedMinutes} minutes**\n` +
+        `Total Time: ${Math.floor(sessionHosters[userId].time / 60)}h ${sessionHosters[userId].time % 60}m`
+      )
+      .setTimestamp();
+  
+    await message.reply({ embeds: [embed] });
+  }
+
+  if (message.content.toLowerCase() === "?sessionlb") {
+    if (Object.keys(sessionHosters).length === 0) {
+      return message.reply("📊 No session data found yet.");
+    }
+  
+    // Sort by total time (descending)
+    const sorted = Object.entries(sessionHosters)
+      .sort(([, a], [, b]) => b.time - a.time)
+      .slice(0, 10);
+  
+    const embed = new EmbedBuilder()
+      .setColor(0x9b59b6)
+      .setTitle("🏆 Session Leaderboard")
+      .setDescription("Top session hosts by total time:")
+      .setTimestamp();
+  
+    sorted.forEach(([userId, data], index) => {
+      embed.addFields({
+        name: `#${index + 1} ${data.tag}`,
+        value: `Sessions: **${data.count}** | Time: **${Math.floor(data.time / 60)}h ${data.time % 60}m**`,
+        inline: false,
+      });
+    });
+  
+    await message.reply({ embeds: [embed] });
+  }
+  
+  
+
+
   //  Non core commands
   // !help command
-  if (message.content.toLowerCase() === "!help") {
+  if (message.content.toLowerCase() === "?help") {
     const helpEmbed = new EmbedBuilder()
       .setColor(0x00ff7f)
       .setTitle("📖 Bot Commands")
@@ -228,24 +490,30 @@ client.on("messageCreate", async (message) => {
         { name: "🛑 `!endcountdown`", value: "Ends the countdown early in the current channel." },
         { name: "🎯 `!dps`", value: "Breaks down which dps are high, mid, and low." },
         { name: "🗑️ `!resetleaderboard`", value: "Admins only: resets the leaderboard completely." },
+        { name: "🛡️ `!pingtankfarm`", value:"Hosts only: Ping for a standard tank farm"},
         { name: "ℹ️ `!help`", value: "Displays this help menu." }
       )
       .setFooter({ text: "Use these commands in chat to interact with the bot." });
 
     await message.reply({ embeds: [helpEmbed] });
   }
-  if (message.content.toLowerCase() === "!dps") {
+  if (message.content.toLowerCase() === "?dps") {
     const file = new AttachmentBuilder("dps.png");
     await message.channel.send({ files: [file] });
   }
-  if (message.content.toLowerCase()=== "!pingtankfarm") {
-    let farmMessage = `# <@&1408954759754285106> Need all roles for 3-3-6 farm. CANNOT FULLY AFK. <@&1408951460984782909> <@&1408951531381723236> <@&1408951564965646447>`;
+  if (message.content.toLowerCase()=== "?pingtankfarm") {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
+      return message.reply("❌ Do not have permission to ping for tank farm");
+    }
+    let farmMessage = `# <@&1345335672852189256> Need all roles for 3-3-6 farm. CANNOT FULLY AFK. <@&1352647499105439754> <@&1352647613962260660> <@&1352647857647259678>`;
 
     await message.channel.send(farmMessage);
   }
-  if (message.content.toLowerCase() === '!sybau') {
+  if (message.content.toLowerCase() === '?sybau') {
     message.reply("https://tenor.com/view/sybau-ts-pmo-gif-2102579015947246168")
   }
+
+
 });
 
 // Helper: end countdown
@@ -253,6 +521,11 @@ async function endCountdown(channelId, client, triggerMsg) {
   const countdown = countdowns[channelId];
   if (!countdown) return;
 
+  if (countdownTimers[channelId]) {
+    clearTimeout(countdownTimers[channelId]);
+    delete countdownTimers[channelId];
+  }
+  
   const elapsedSeconds = Math.floor(Date.now() / 1000) - countdown.startTime;
   const elapsedMinutes = Math.floor(elapsedSeconds / 60);
 
