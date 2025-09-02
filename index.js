@@ -1,8 +1,10 @@
-const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, PermissionsBitField } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, PermissionsBitField,ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType } = require("discord.js");
 const { token } = require('./config.json');
 const fs = require("fs");
 const moment = require("moment-timezone");
 const path = require("path");
+const { createCanvas } = require("canvas");
+
 
 // File paths
 const countdownsFile = "./countdowns.json";
@@ -86,6 +88,104 @@ function logAction(client, msg) {
   const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
   if (logChannel) logChannel.send(msg).catch(() => {});
 }
+const TRANSACTION_CHANNEL_ID = "1408696241461661796"
+function logTransaction(client, msg) {
+    const logChannel = client.channels.cache.get(TRANSACTION_CHANNEL_ID);
+  if (logChannel) logChannel.send({ embeds: [msg] }).catch(() => {});
+}
+// warns top level
+  const warnsFile = "./warns.json";
+  let warns = loadJSON(warnsFile);
+  if (!warns.bans) warns.bans = {};       // active bans by key "guildId:userId"
+  if (!warns.history) warns.history = {}; // array of ban records per user key
+  function saveWarns() { saveJSON(warnsFile, warns); }
+
+  const LORD_BAN_ROLE_NAME = "lordban"; // role name (case-insensitive)
+  const BAN_SWEEP_INTERVAL_MS = 60_000; // check every 60s
+  const banTimers = new Map();          // optional in-case you want per-ban timers
+
+  function genBanId() {
+    return Math.random().toString(36).slice(2, 8) + "-" + Date.now().toString(36);
+  }
+
+  function userKey(guildId, userId) {
+    return `${guildId}:${userId}`;
+  }
+
+  function getLordbanRole(guild) {
+    if (!guild) return null;
+    return guild.roles.cache.find(r => r.name.toLowerCase() === LORD_BAN_ROLE_NAME.toLowerCase()) || null;
+  }
+
+  async function liftBan(guild, entry, status = "expired") {
+    try {
+      const role = getLordbanRole(guild);
+      if (!role) {
+        // Still mark as ended so the system doesn't loop forever
+        finalizeBan(entry, status);
+        saveWarns();
+        logAction(client, `⚠️ Could not remove role for ban **${entry.id}** (role missing). Marked ended.`);
+        return;
+      }
+
+      const member = await guild.members.fetch(entry.userId).catch(() => null);
+      if (member && member.roles.cache.has(role.id)) {
+        await member.roles.remove(role, `Lordban ended (${status}).`);
+      }
+
+      finalizeBan(entry, status);
+      saveWarns();
+      logAction(client, `✅ Lordban **${entry.id}** ended for <@${entry.userId}> (${status}).`);
+    } catch (e) {
+      console.error("Failed to lift ban:", e);
+    }
+  }
+
+  function finalizeBan(entry, status) {
+    const key = userKey(entry.guildId, entry.userId);
+
+    // Mark history entry as ended
+    if (warns.history[key]) {
+      const idx = warns.history[key].findIndex(h => h.id === entry.id);
+      if (idx !== -1) {
+        warns.history[key][idx].status = status;
+        warns.history[key][idx].liftedAt = Date.now();
+      }
+    }
+
+    // Remove from active list
+    delete warns.bans[key];
+  }
+
+  async function ensureRoleApplied(guild, entry) {
+    const role = getLordbanRole(guild);
+    if (!role) return false;
+
+    const member = await guild.members.fetch(entry.userId).catch(() => null);
+    if (!member) return false;
+
+    if (!member.roles.cache.has(role.id)) {
+      await member.roles.add(role, `Lordban active. Ban ID: ${entry.id}`);
+    }
+    return true;
+  }
+
+  // Periodic sweep to enforce/expire bans (survives restarts)
+  async function sweepBans() {
+    const now = Date.now();
+    for (const key of Object.keys(warns.bans)) {
+      const entry = warns.bans[key];
+      const guild = client.guilds.cache.get(entry.guildId);
+      if (!guild) continue;
+
+      if (now >= entry.endAt) {
+        await liftBan(guild, entry, "expired");
+      } else {
+        // Keep role applied in case the bot restarted or role was removed manually
+        await ensureRoleApplied(guild, entry).catch(() => {});
+      }
+    }
+  }
 
 // Client
 const client = new Client({
@@ -97,16 +197,16 @@ client.once("ready", () => {
   // Reset countdowns on restart
   countdowns = {};
   saveCountdowns();
+
+  // Start lordban sweeper
+  setInterval(sweepBans, BAN_SWEEP_INTERVAL_MS);
+  // Run once immediately on boot
+  sweepBans();
 });
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   // Time Commands
-  const restrictedRoles = [
-    1408951460984782909,    // replace with real ID
-    1408951531381723236, // replace with real ID
-    1408951564965646447    // replace with real ID
-  ];
 
   // Only apply restriction if the user does NOT have ViewAuditLog permission
   if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
@@ -157,7 +257,7 @@ client.on("messageCreate", async (message) => {
   }
 
   // Countdown Commands
-  if (message.content.toLowerCase() === "?countdown") {
+  if (message.content.toLowerCase() === "?countdown" || message.content.toLowerCase() === "?farm") {
     const channelId = message.channel.id;
 
     if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
@@ -203,7 +303,7 @@ client.on("messageCreate", async (message) => {
       if (countdowns[channelId]) {
         endCountdown(channelId, client, sentMsg);
       }
-    }, 10000);
+    }, 3600000);
 
     logAction(client, `⏳ Farm started in <#${channelId}> by **${authorName}**.`);
   }
@@ -219,7 +319,7 @@ client.on("messageCreate", async (message) => {
 
     for (const [channelId, data] of Object.entries(countdowns)) {
       embed.addFields({
-        name: `Channel <#${channelId}>`,
+        name: `${data.authorName}-<#${channelId}>`,
         value: `Ends <t:${data.endTime}:R> (<t:${data.endTime}:t>)`,
         inline: false
       });
@@ -227,7 +327,7 @@ client.on("messageCreate", async (message) => {
 
     await message.reply({ embeds: [embed] });
   }
-  if (message.content.toLowerCase() === "?endcountdown") {
+  if (message.content.toLowerCase() === "?endcountdown" || message.content.toLowerCase() === "?end") {
     const channelId = message.channel.id;
     if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
       return message.reply("❌ Do not have the permission to end a farm");
@@ -243,55 +343,198 @@ client.on("messageCreate", async (message) => {
 
   // Leaderboard Commands/
   if (message.content.toLowerCase() === "?resetleaderboard") {
-    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
       return message.reply("❌ Only admins can reset the leaderboard.");
     }
-    hosters = {};
+  
+    for (const userId in hosters) {
+      if (hosters[userId].week !== undefined) {
+        hosters[userId].week = 0; // reset weekly time
+      }
+      if (hosters[userId].weekCount !== undefined) {
+        hosters[userId].weekCount = 0; // reset weekly count if you track it separately
+      }
+    }
+  
     saveHosters();
-    message.reply("✅ Leaderboard has been reset.");
-    logAction(client, `🗑️ Leaderboard was reset by **${message.author.username}**.`);
+    message.reply("✅ Weekly leaderboard has been reset.");
+    logAction(client, `🗑️ Weekly leaderboard was reset by **${message.author.username}**.`);
   }
-  if (message.content.toLowerCase() === "?leaderboard") {
-  const entries = Object.entries(hosters);
-
-  if (entries.length === 0) {
-    return message.reply("📉 No hosting data yet.");
-  }
-
-  // Sort by total time DESC, then by count DESC
-  const sorted = entries
-    .sort((a, b) => {
+  if (message.content.toLowerCase() === "?leaderboard" || message.content.toLowerCase() === "?lb") {
+    const entries = Object.entries(hosters);
+  
+    if (entries.length === 0) {
+      return message.reply("📉 No hosting data yet.");
+    }
+  
+    // Sort by total time DESC, then by count DESC
+    const sorted = entries.sort((a, b) => {
       const ta = (a[1].time ?? 0);
       const tb = (b[1].time ?? 0);
       if (tb !== ta) return tb - ta;
       return (b[1].count ?? 0) - (a[1].count ?? 0);
-    })
-    .slice(0, 10);
-
-  const embed = new EmbedBuilder()
-    .setColor(0xf1c40f)
-    .setTitle("🏆 Top Hosts Leaderboard")
-    .setDescription("Ranked by total hosted time.")
-    .setTimestamp();
-
-  let rank = 1;
-  for (const [, data] of sorted) {
-    const minutes = data.time ?? 0;
-    const hours = Math.floor(minutes / 60);
-    const mins  = minutes % 60;
-    const sessions = data.count ?? 0;
-
-    embed.addFields({
-      name: `#${rank} — ${data.tag}`,
-      value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
-      inline: false,
     });
-    rank++;
+  
+    // Split into pages (10 per page = safe for fields)
+    const perPage = 10;
+    const pages = [];
+    for (let i = 0; i < sorted.length; i += perPage) {
+      const chunk = sorted.slice(i, i + perPage);
+      let rank = i + 1;
+  
+      const embed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle("🏆 Top Hosts Leaderboard")
+        .setDescription("Ranked by total hosted time.")
+        .setTimestamp();
+  
+      for (const [, data] of chunk) {
+        const minutes = data.time ?? 0;
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        const sessions = data.count ?? 0;
+  
+        embed.addFields({
+          name: `#${rank} — ${data.tag}`,
+          value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
+          inline: false,
+        });
+        rank++;
+      }
+  
+      pages.push(embed);
+    }
+  
+    let pageIndex = 0;
+  
+    // Buttons
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("prev")
+        .setLabel("⬅️ Prev")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("next")
+        .setLabel("Next ➡️")
+        .setStyle(ButtonStyle.Primary)
+    );
+  
+    const reply = await message.reply({
+      embeds: [pages[pageIndex]],
+      components: pages.length > 1 ? [row] : [],
+    });
+  
+    if (pages.length <= 1) return;
+  
+    const collector = reply.createMessageComponentCollector({
+      filter: (i) => i.user.id === message.author.id,
+      time: 60_000, // 1 minute timeout
+    });
+  
+    collector.on("collect", async (interaction) => {
+      if (interaction.customId === "prev") {
+        pageIndex = (pageIndex - 1 + pages.length) % pages.length;
+      } else if (interaction.customId === "next") {
+        pageIndex = (pageIndex + 1) % pages.length;
+      }
+      await interaction.update({
+        embeds: [pages[pageIndex]],
+        components: [row],
+      });
+    });
+  
+    collector.on("end", async () => {
+      await reply.edit({ components: [] }); // disable buttons after timeout
+    });
   }
-
-  await message.reply({ embeds: [embed] });
+  if (message.content.toLowerCase() === "?week") {
+    const entries = Object.entries(hosters);
+  
+    if (entries.length === 0) {
+      return message.reply("📉 No hosting data yet.");
+    }
+  
+    // Sort by total time DESC, then by count DESC
+    const sorted = entries.sort((a, b) => {
+      const ta = (a[1].week ?? 0);
+      const tb = (b[1].week ?? 0);
+      if (tb !== ta) return tb - ta;
+      return (b[1].count ?? 0) - (a[1].count ?? 0);
+    });
+  
+    // Split into pages (10 per page = safe for fields)
+    const perPage = 10;
+    const pages = [];
+    for (let i = 0; i < sorted.length; i += perPage) {
+      const chunk = sorted.slice(i, i + perPage);
+      let rank = i + 1;
+  
+      const embed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle("🏆 Top Hosts Leaderboard")
+        .setDescription("Ranked by total hosted time.")
+        .setTimestamp();
+  
+      for (const [, data] of chunk) {
+        const minutes = data.week ?? 0;
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        const sessions = data.weekCount ?? 0;
+  
+        embed.addFields({
+          name: `#${rank} — ${data.tag}`,
+          value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
+          inline: false,
+        });
+        rank++;
+      }
+  
+      pages.push(embed);
+    }
+  
+    let pageIndex = 0;
+  
+    // Buttons
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("prev")
+        .setLabel("⬅️ Prev")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId("next")
+        .setLabel("Next ➡️")
+        .setStyle(ButtonStyle.Primary)
+    );
+  
+    const reply = await message.reply({
+      embeds: [pages[pageIndex]],
+      components: pages.length > 1 ? [row] : [],
+    });
+  
+    if (pages.length <= 1) return;
+  
+    const collector = reply.createMessageComponentCollector({
+      filter: (i) => i.user.id === message.author.id,
+      time: 60_000, // 1 minute timeout
+    });
+  
+    collector.on("collect", async (interaction) => {
+      if (interaction.customId === "prev") {
+        pageIndex = (pageIndex - 1 + pages.length) % pages.length;
+      } else if (interaction.customId === "next") {
+        pageIndex = (pageIndex + 1) % pages.length;
+      }
+      await interaction.update({
+        embeds: [pages[pageIndex]],
+        components: [row],
+      });
+    });
+  
+    collector.on("end", async () => {
+      await reply.edit({ components: [] }); // disable buttons after timeout
+    });
   }
-
+  
   // Money Commands
   // add money (admin only)
   if (message.content.toLowerCase().startsWith("?pay")) {
@@ -310,8 +553,18 @@ client.on("messageCreate", async (message) => {
     if (!balances[user.id]) balances[user.id] = { balance: 0 };
     balances[user.id].balance += amount;
     saveBalances();
+    const embed = new EmbedBuilder()
+    .setColor(0x00ff00)
+    .setTitle("💰 Payment Added" )
+    .addFields(
+      { name: "User", value: `${user.tag}`, inline: true },
+      { name: "Amount", value: `$${amount.toFixed(2)}`, inline: true },
+    )
+    .setTimestamp();
+    logTransaction(client, embed)
   
     message.channel.send(`💰 Added **$${amount.toFixed(2)}** to ${user.username}'s account. New balance: **$${balances[user.id].balance.toFixed(2)}**`);
+    await message.delete().catch(() => {});
   }
   // Subtract money (admin only)
   if (message.content.toLowerCase().startsWith("?paid")) {
@@ -330,8 +583,18 @@ client.on("messageCreate", async (message) => {
     if (!balances[user.id]) balances[user.id] = { balance: 0 };
     balances[user.id].balance -= amount;
     saveBalances();
+    const embed = new EmbedBuilder()
+    .setColor(0xff0000)
+    .setTitle("💰 Payment Deducted" )
+    .addFields(
+      { name: "User", value: `${user.tag}`, inline: true },
+      { name: "Amount", value: `$${amount.toFixed(2)}`, inline: true },
+    )
+    .setTimestamp();
+    logTransaction(client,embed)
   
     message.channel.send(`💸 Subtracted **$${amount.toFixed(2)}** from ${user.username}'s account. New balance: **$${balances[user.id].balance.toFixed(2)}**`);
+    await message.delete().catch(() => {});
   }
   // Check balance (admin can check anyone, users can only check their own)
   if (message.content.toLowerCase().startsWith("!balance")) {
@@ -345,42 +608,52 @@ client.on("messageCreate", async (message) => {
     if (!balances[user.id]) balances[user.id] = { balance: 0 };
   
     message.channel.send(`💳 Balance for **${user.username}**: **$${balances[user.id].balance.toFixed(2)}**`);
+    await message.delete().catch(() => {});
   }
+
   if (message.content.toLowerCase() === "?ledger") {
     if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
       return message.reply("❌ Only admins can view the ledger.");
     }
-
+  
     if (Object.keys(balances).length === 0) {
       return message.reply("📒 The ledger is empty. No balances found.");
     }
-
+  
     const embed = new EmbedBuilder()
       .setColor(0x3498db)
       .setTitle("📒 Full Ledger")
-      .setDescription("List of all balances stored in the system:")
+      .setDescription("List of all balances stored in the system (sorted by richest first):")
       .setTimestamp();
-
-    for (const [userId, data] of Object.entries(balances)) {
+  
+    // 🔽 Sort balances by descending order
+    const sortedEntries = Object.entries(balances).sort((a, b) => {
+      const balanceA = a[1].balance ?? 0;
+      const balanceB = b[1].balance ?? 0;
+      return balanceB - balanceA; // bigger balances come first
+    });
+  
+    for (const [userId, data] of sortedEntries) {
       try {
         const user = await message.client.users.fetch(userId); // fetch user by ID
         embed.addFields({
-        name: user.tag, // DiscordTag (e.g., MyUser#1234)
-        value: `$${(data.balance ?? 0).toFixed(2)}`,
-        inline: true
+          name: user.tag, // DiscordTag (e.g., MyUser#1234)
+          value: `$${(data.balance ?? 0).toFixed(2)}`,
         });
       } catch (err) {
-      // Fallback in case user can't be fetched (e.g. left server)
-      embed.addFields({
-        name: `Unknown User (${userId})`,
-        value: `$${(data.balance ?? 0).toFixed(2)}`,
-        inline: true
-      });
+        // Fallback in case user can't be fetched (e.g. left server)
+        embed.addFields({
+          name: `Unknown User (${userId})`,
+          value: `$${(data.balance ?? 0).toFixed(2)}`,
+          inline: true
+        });
+      }
     }
+    await message.channel.send({ embeds: [embed] });
+    await message.delete().catch(() => {});
   }
 
-  await message.reply({ embeds: [embed] });
-}
+  
 
   // Session commands
   if (message.content.toLowerCase() === "?session") {
@@ -512,6 +785,331 @@ client.on("messageCreate", async (message) => {
   if (message.content.toLowerCase() === '?sybau') {
     message.reply("https://tenor.com/view/sybau-ts-pmo-gif-2102579015947246168")
   }
+  if (message.content.toLowerCase().startsWith("!addtime")) {
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog) && message.author.id != "1029305942313021520") {
+      return message.reply("❌ Only mods/Dirac can add time.");
+    }
+  
+    const args = message.content.split(" ");
+    if (args.length < 3) {
+      return message.reply("⚠️ Usage: `!addtime @user <minutes>`");
+    }
+  
+    const target = message.mentions.users.first();
+    const minutes = parseInt(args[2], 10);
+  
+    if (!target) {
+      return message.reply("⚠️ Please mention a valid user.");
+    }
+    if (isNaN(minutes) || minutes <= 0) {
+      return message.reply("⚠️ Please provide a valid positive number of minutes.");
+    }
+  
+    // Ensure the user exists in hosters
+    if (!hosters[target.id]) {
+      hosters[target.id] = {
+        tag: target.tag,
+        count: 0,
+        time: 0,
+        week: 0,
+      };
+    }
+  
+    // Add time to both all-time and weekly
+    hosters[target.id].time += minutes;
+    hosters[target.id].week += minutes;
+  
+    saveHosters();
+  
+    message.reply(
+      `✅ Added **${minutes} minutes** to ${target.tag}'s time.\n` +
+      `⏱️ New totals → All-time: **${hosters[target.id].time}m**, Weekly: **${hosters[target.id].week}m**`
+    );
+
+    
+  }
+  if (message.content.toLowerCase() === "!slapshadow"){
+    message.reply("https://images-ext-1.discordapp.net/external/3vm4CyZKFYQBYn0rHq3venph0yjW57PgehvvSK1sWmM/https/media.tenor.com/Z7GWN6L9GzwAAAPo/powerslap-slap-ko.mp4")
+  }
+
+  // Lord Banning
+  // ── !lordban @user <days> <reason> ────────────────────────────────────────────
+if (message.content.toLowerCase().startsWith("!lordban")) {
+  // Permissions: require ManageRoles
+  if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
+    return message.reply("❌ You need to be a host to use this.");
+  }
+
+  // Bot must be able to manage roles
+  if (!message.guild.members.me.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
+    return message.reply("❌ You need to be a host to use this.");
+  }
+
+  const role = getLordbanRole(message.guild);
+  if (!role) {
+    return message.reply(`❌ Role **${LORD_BAN_ROLE_NAME}** not found. Please create it first.`);
+  }
+
+  const args = message.content.trim().split(/\s+/).slice(1);
+  const target = message.mentions.members.first();
+  const daysStr = args[1];
+  const reason = args.slice(2).join(" ").trim();
+
+  if (!target) {
+    return message.reply("⚠️ Usage: `!lordban @user <days> <reason>`");
+  }
+  const days = parseFloat(daysStr);
+  if (isNaN(days) || days <= 0) {
+    return message.reply("⚠️ Please provide a valid number of **days** (e.g., `3` or `2.5`).");
+  }
+  if (!reason) {
+    return message.reply("⚠️ Please provide a **reason**.");
+  }
+
+  // Prevent duplicate active bans per user
+  const key = userKey(message.guild.id, target.id);
+  if (warns.bans[key]) {
+    const existing = warns.bans[key];
+    const endsInSec = Math.floor(existing.endAt / 1000);
+    return message.reply(
+      `⚠️ <@${target.id}> already has an active lordban (ID: \`${existing.id}\`). Ends <t:${endsInSec}:R> (<t:${endsInSec}:t>).`
+    );
+  }
+
+  // Role hierarchy check (bot must be above the role and target)
+  const me = message.guild.members.me;
+  if (me.roles.highest.position <= role.position) {
+    return message.reply("❌ My role must be **higher** than the lordban role to assign it.");
+  }
+  if (me.roles.highest.position <= (target.roles.highest?.position ?? 0)) {
+    return message.reply("❌ I cannot modify this member because their highest role is above mine.");
+  }
+
+  // Build ban entry
+  const id = genBanId();
+  const startAt = Date.now();
+  const endAt = startAt + Math.round(days * 24 * 60 * 60 * 1000);
+
+  const entry = {
+    id,
+    guildId: message.guild.id,
+    userId: target.id,
+    modId: message.author.id,
+    reason,
+    days,
+    startAt,
+    endAt,
+    status: "active"
+  };
+
+  try {
+    // Assign role
+    await target.roles.add(role, `Lordban ${days} day(s) by ${message.author.tag}: ${reason}`);
+
+    // Persist active ban and history
+    warns.bans[key] = entry;
+    if (!warns.history[key]) warns.history[key] = [];
+    warns.history[key].push({ ...entry }); // snapshot into history
+    saveWarns();
+
+    // Nice confirmation embed
+    const endsInSec = Math.floor(endAt / 1000);
+    const embed = new EmbedBuilder()
+      .setColor(0xff7a00)
+      .setTitle("🔨 Lordban Issued")
+      .setDescription(
+        [
+          `**User:** <@${target.id}>`,
+          `**Moderator:** <@${message.author.id}>`,
+          `**Duration:** ${days} day(s)`,
+          `**Ends:** <t:${endsInSec}:R> (<t:${endsInSec}:t>)`,
+          `**Reason:** ${reason}`,
+          `**Ban ID:** \`${id}\``
+        ].join("\n")
+      )
+      .setTimestamp();
+
+    await message.reply({ embeds: [embed] });
+    logAction(client, `🔨 Lordban **${id}** → <@${target.id}> (${days}d) by **${message.author.tag}** — ${reason}`);
+  } catch (err) {
+    console.error("Failed to assign lordban role:", err);
+    return message.reply("❌ I couldn't assign the role. Check my permissions/role position and try again.");
+  }
+}
+
+if (message.content.toLowerCase().startsWith("!reduceban")) {
+  const args = message.content.trim().split(/ +/).slice(1);
+  const target = message.mentions.users.first();
+  if (!target) {
+    return message.reply("⚠️ Please mention a valid user.");
+  }
+
+  const daysToReduce = parseFloat(args[1]);
+  if (isNaN(daysToReduce) || daysToReduce <= 0) {
+    return message.reply("⚠️ Please provide a valid number of days (can be decimal).");
+  }
+
+  const guildId = message.guild.id;
+  const userId = target.id;
+  const key = `${guildId}:${userId}`;
+  const ban = warns.bans[key];
+
+  if (!ban || ban.status !== "active") {
+    return message.reply("⚠️ That user does not have an active lordban.");
+  }
+
+  const now = Date.now();
+  const reduceMs = daysToReduce * 24 * 60 * 60 * 1000;
+  const remaining = ban.endAt - now;
+
+  if (reduceMs >= remaining) {
+    // fully lift the ban
+    ban.status = "expired";
+    ban.liftedAt = now;
+
+    // ✅ update existing history entry instead of pushing duplicate
+    if (!warns.history[key]) warns.history[key] = [];
+    const histEntry = warns.history[key].find(b => b.id === ban.id);
+    if (histEntry) {
+      histEntry.status = "expired";
+      histEntry.liftedAt = now;
+    } else {
+      warns.history[key].push({ ...ban });
+    }
+
+    delete warns.bans[key];
+
+    // remove role
+    const guild = message.guild;
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member) {
+      const role = guild.roles.cache.find(r => r.name === "lordban");
+      if (role && member.roles.cache.has(role.id)) {
+        await member.roles.remove(role, "Lordban fully lifted");
+      }
+    }
+
+    message.reply(`✅ Lordban for **${target.tag}** has been fully lifted.`);
+    logAction(client, `Lordban fully lifted early for ${target.tag} by ${message.author.tag}.`);
+  } else {
+    // just reduce duration
+    ban.endAt -= reduceMs;
+    const newRemaining = (ban.endAt - now) / (24 * 60 * 60 * 1000);
+
+    message.reply(
+      `✅ Reduced lordban for **${target.tag}** by ${daysToReduce} days. Remaining: ${newRemaining.toFixed(2)} days.`
+    );
+
+    logAction(client,
+      `Lordban reduced for ${target.tag} by ${daysToReduce} days by ${message.author.tag}.`
+    );
+  }
+
+  fs.writeFileSync(warnsFile, JSON.stringify(warns, null, 2));
+}
+if (message.content.toLowerCase().startsWith("!history")) {
+  const args = message.content.trim().split(/ +/).slice(1);
+  const target = message.mentions.users.first();
+
+  let userToCheck;
+
+  if (message.member.permissions.has("ManageNicknames")) {
+    // Mods can check anyone, but default to themselves if no mention
+    userToCheck = target || message.author;
+  } else {
+    // Regular members: can only check themselves
+    if (target && target.id !== message.author.id) {
+      return message.reply("❌ You can only view your own ban history.");
+    }
+    userToCheck = message.author;
+  }
+
+  const key = `${message.guild.id}:${userToCheck.id}`;
+  const userHistory = warns.history[key];
+
+  if (!userHistory || userHistory.length === 0) {
+    return message.reply(`ℹ️ No ban history found for **${userToCheck.tag}**.`);
+  }
+
+  // 🔹 Refresh statuses (mark expired bans properly)
+  const now = Date.now();
+  for (const ban of userHistory) {
+    if (ban.status === "active" && now >= ban.endAt) {
+      ban.status = "expired";
+      ban.liftedAt = ban.liftedAt || now;
+      if (warns.bans[key] && warns.bans[key].id === ban.id) {
+        delete warns.bans[key];
+      }
+    }
+  }
+  fs.writeFileSync(warnsFile, JSON.stringify(warns, null, 2));
+
+  // Build embed
+  const { EmbedBuilder } = require("discord.js");
+  const embed = new EmbedBuilder()
+    .setTitle(`📜 Ban History for ${userToCheck.tag}`)
+    .setColor("Blue")
+    .setFooter({ text: "Created by Dirac" });
+
+  for (const ban of userHistory) {
+    embed.addFields({
+      name: `ID: ${ban.id} | Status: ${ban.status}`,
+      value: `**Reason:** ${ban.reason}\n**Moderator:** <@${ban.modId}>\n**Duration:** ${ban.days} day(s)\n**Start:** <t:${Math.floor(
+        ban.startAt / 1000
+      )}:F>\n**End:** <t:${Math.floor(ban.endAt / 1000)}:F>${
+        ban.liftedAt
+          ? `\n**Lifted:** <t:${Math.floor(ban.liftedAt / 1000)}:F>`
+          : ""
+      }`,
+      inline: false,
+    });
+  }
+
+  return message.channel.send({ embeds: [embed] });
+}
+
+if (message.content.toLowerCase().startsWith("!scrub")) {
+  // Permission check
+  if (!message.member.permissions.has("ViewAuditLog")) {
+    return message.reply("❌ You don’t have permission to use this command.");
+  }
+
+  const args = message.content.trim().split(/ +/).slice(1);
+  const banId = args[0];
+
+  if (!banId) {
+    return message.reply("⚠️ Usage: `!scrub <banId>`");
+  }
+
+  let found = false;
+  for (const [key, historyArr] of Object.entries(warns.history)) {
+    const index = historyArr.findIndex(b => b.id === banId);
+    if (index !== -1) {
+      const ban = historyArr[index];
+
+      if (ban.status !== "expired") {
+        return message.reply("❌ Only expired bans can be scrubbed.");
+      }
+
+      // Remove from history
+      historyArr.splice(index, 1);
+      fs.writeFileSync(warnsFile, JSON.stringify(warns, null, 2));
+
+      message.reply(`🧹 Ban ID \`${banId}\` has been scrubbed from <@${ban.userId}>'s record.`);
+      logAction(client, `🧹 Ban ID ${banId} scrubbed from <@${ban.userId}> by ${message.author.tag}`);
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    return message.reply("⚠️ No expired ban found with that ID. The scrub only exists for expired bans. If this is for an active ban, please end that ban first");
+  }
+}
+
+
+
+
 
 
 });
@@ -531,10 +1129,12 @@ async function endCountdown(channelId, client, triggerMsg) {
 
   // Update leaderboard
   if (!hosters[countdown.authorId]) {
-    hosters[countdown.authorId] = { tag: countdown.authorName, count: 0, time: 0 };
+    hosters[countdown.authorId] = { tag: countdown.authorName, count: 0, time: 0, week: 0, weekCount: 0 };
   }
   hosters[countdown.authorId].count += 1;
   hosters[countdown.authorId].time += elapsedMinutes;
+  hosters[countdown.authorId].weekCount += 1;
+  hosters[countdown.authorId].week += elapsedMinutes;
   saveHosters();
 
   // Delete countdown
@@ -561,7 +1161,8 @@ async function endCountdown(channelId, client, triggerMsg) {
   if (logChannel) await logChannel.send({ embeds: [logEmbed] });
 
   if (triggerMsg.reply) {
-    await triggerMsg.reply(`⏹️ Farm ended. Hosted for ${elapsedMinutes} minutes.`);
+    replyChannel = client.channels.cache.get(channelId);
+    await replyChannel.send(`⏹️ Farm ended. Hosted for ${elapsedMinutes} minutes.`);
   }
 }
 
