@@ -1,15 +1,100 @@
-const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, PermissionsBitField,ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, PermissionsBitField,ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType, Partials, ChannelType, REST, Routes, SlashCommandBuilder } = require("discord.js");
 const { token } = require('./config.json');
 const fs = require("fs");
 const moment = require("moment-timezone");
 const path = require("path");
 const { createCanvas } = require("canvas");
+let customs = {};
+try {
+  customs = JSON.parse(fs.readFileSync("./customs.json", "utf8"));
+} catch (e) {
+  customs = {};
+}
+
+const TASKS_FILE = "./tasks.json";
+const validCommands = [
+  "?time",
+  "?countdown", "?farm",
+  "?status",
+  "?endcountdown", "?end",
+  "?resetleaderboard",
+  "?leaderboard", "?lb",
+  "?week",
+  "?pay", "?paid", "?balance", "?ledger",
+  "?session", "?endsession", "?sessionlb",
+  "?help",
+  "?dps",
+  "?pingtankfarm",
+  "?sybau",
+  "?addtime"
+];
+function isTaskManager(member) {
+  return member.permissions.has(PermissionsBitField.Flags.Administrator) || 
+         member.roles.cache.has("1396678984628178974");
+}
+function loadTasks() {
+  if (!fs.existsSync(TASKS_FILE)) return {};
+  return JSON.parse(fs.readFileSync(TASKS_FILE));
+}
+
+// Utility: save tasks
+function saveTasks(tasks) {
+  fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2));
+}
+async function sendTaskReminder(client, userId) {
+  const tasks = loadTasks();
+  const userTasks = tasks[userId]?.tasks || [];
+  const pendingTasks = userTasks.filter(t => !t.completed);
+
+  if (pendingTasks.length === 0) return; // no pending tasks → no DM
+
+  const user = await client.users.fetch(userId).catch(() => null);
+  if (!user) return;
+
+  const embed = new EmbedBuilder()
+    .setColor("Blue")
+    .setTitle("⏰ Task Reminder")
+    .setDescription(
+      pendingTasks.map((t, i) => `**${i + 1}.** ${t.description} ❌`).join("\n")
+    )
+    .setFooter({ text: "Please complete these tasks soon!" })
+    .setTimestamp();
+
+  user.send({ embeds: [embed] }).catch(() => {});
+}
+
+
+function saveCustoms() {
+  fs.writeFileSync("./customs.json", JSON.stringify(customs, null, 2));
+}
+const customRolesFile = "./customRoles.json";
+let customRoles = loadJSON(customRolesFile);
+function saveCustomRoles() { saveJSON(customRolesFile, customRoles); }
+
+const ROLE_IDS = {
+  trial: "1417969865058418738",
+  host: "1414176244072976486",
+  vet: "1414176248413925446"
+};
+
+function getRank(member) {
+  if (!member || !member.roles) return null;
+
+  if (member.roles.cache.has(ROLE_IDS.vet)) return "vet";
+  if (member.roles.cache.has(ROLE_IDS.host)) return "host";
+  if (member.roles.cache.has(ROLE_IDS.trial)) return "trial";
+
+  return null;
+}
+
+
 
 
 // File paths
 const countdownsFile = "./countdowns.json";
 const hostersFile = "./hosters.json";
 const sessionHostersFile = "./sessionHosters.json";
+const profanity = JSON.parse(fs.readFileSync("./profanity.json", "utf8"));
 
 function loadSessionHosters() {
   if (fs.existsSync(sessionHostersFile)) {
@@ -40,6 +125,15 @@ function saveSessions() {
 // sessions keyed by userId
 let sessions = loadSessions();
 
+// Crown milestones
+function getCrowns(totalMinutes) {
+  const hours = Math.floor(totalMinutes / 60);
+  if (hours >= 600) return "🔴"; // special red crown
+  if (hours >= 450) return "👑👑👑";
+  if (hours >= 300) return "👑👑";
+  if (hours >= 150) return "👑";
+  return "";
+}
 
 
 // Allowed farm channels
@@ -93,6 +187,7 @@ function logTransaction(client, msg) {
     const logChannel = client.channels.cache.get(TRANSACTION_CHANNEL_ID);
   if (logChannel) logChannel.send({ embeds: [msg] }).catch(() => {});
 }
+
 // warns top level
   const warnsFile = "./warns.json";
   let warns = loadJSON(warnsFile);
@@ -186,27 +281,199 @@ function logTransaction(client, msg) {
       }
     }
   }
+  async function sweepCustomRoles() {
+    const now = Date.now();
+    for (const key of Object.keys(customRoles)) {
+      const entry = customRoles[key];
+      const guild = client.guilds.cache.get(entry.guildId);
+      if (!guild) continue;
+  
+      if (now >= entry.endAt) {
+        try {
+          const member = await guild.members.fetch(entry.userId).catch(() => null);
+          if (member && member.roles.cache.has(entry.roleId)) {
+            await member.roles.remove(entry.roleId, "Custom role expired");
+          }
+        } catch (err) {
+          console.error("Failed to remove custom role:", err);
+        }
+        delete customRoles[key];
+        saveCustomRoles();
+      }
+    }
+  }
+  
 
 // Client
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers
+  ],
+  partials: [Partials.Channel]
 });
+   // category in source guild
 
-client.once("ready", () => {
+// Mapping of { sourceChannelId: targetChannelId 
+
+// sourceChannelId -> targetChannelId
+
+
+// Simple bounded message cache: messageId -> { content, attachments: [url1, url2], authorId }
+// keeps most recent N messages per whole cache
+const MESSAGE_CACHE_MAX = 5000;
+const messageCache = new Map();
+
+// helper: keep cache size bounded
+function cacheSet(messageId, data) {
+  if (!messageId) return;
+  messageCache.set(messageId, data);
+  // if over limit, delete oldest entry
+  if (messageCache.size > MESSAGE_CACHE_MAX) {
+    const firstKey = messageCache.keys().next().value;
+    if (firstKey) messageCache.delete(firstKey);
+  }
+}
+
+function arraysEqual(a = [], b = []) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+
+
+client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   // Reset countdowns on restart
-  countdowns = {};
-  saveCountdowns();
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('link')
+      .setDescription('Post a clean link to the channel')
+      .addStringOption(option =>
+        option.setName('url')
+          .setDescription('The link to post')
+          .setRequired(true)
+      )
+      .toJSON()
+  ];
+  
+  const now = Math.floor(Date.now() / 1000);
+  for (const [channelId, data] of Object.entries(countdowns)) {
+    const remainingMs = (data.endTime - now) * 1000;
+
+    if (remainingMs <= 0) {
+      // countdown expired while bot was offline → end it immediately
+      await endCountdown(channelId, client, { reply: true });
+    } else {
+      // schedule the end
+      countdownTimers[channelId] = setTimeout(() => {
+        endCountdown(channelId, client, { reply: true });
+      }, remainingMs);
+    }
+  }
 
   // Start lordban sweeper
   setInterval(sweepBans, BAN_SWEEP_INTERVAL_MS);
   // Run once immediately on boot
   sweepBans();
+  setInterval(sweepCustomRoles, 60 * 1000); // every hour
+  sweepCustomRoles(); // run once on boot
+  setInterval(async () => {
+    const tasks = loadTasks();
+
+    // DM each user with their pending tasks
+    for (const userId of Object.keys(tasks)) {
+      await sendTaskReminder(client, userId);
+    }
+
+    // Send full report to owner
+    const allDesc = Object.entries(tasks)
+      .map(([uid, data]) => {
+        if (!data.tasks || data.tasks.length === 0) return null;
+        const pending = data.tasks
+          .map((t, i) => `**${i + 1}.** ${t.description} ${t.completed ? "✅" : "❌"}`)
+          .join("\n");
+        return `**<@${uid}>**\n${pending}`;
+      })
+      .filter(Boolean)
+      .join("\n\n");
+
+    if (allDesc) {
+      const embed = new EmbedBuilder()
+        .setColor("Purple")
+        .setTitle("📋 Daily Task Report")
+        .setDescription(allDesc)
+        .setTimestamp();
+
+      const owner = await client.users.fetch("852708223499632661").catch(() => null);
+      console.log(owner)
+      if (owner) {
+        console.log("sent msg to owner")
+        owner.send({ embeds: [embed] }).catch(() => {});
+      }
+    }
+  }, 24*60*60 * 1000);
+  
 });
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   // Time Commands
+  /*
+  let content = message.content.toLowerCase();
+// 🔹 Check for "mute" words
+  for (const word of profanity.warn) {
+    if (content.includes(word)) {
+      try {
+        await message.delete();
+        await message.channel.send(
+          `⚠️ The word you used is not allowed, <@${message.author.id}>.`
+        );
+      } catch (err) {
+        console.error("Failed to warn:", err);
+      }
+      return;
+    }
+  }
+  for (const word of profanity.restricted.words) {
+    if (content.includes(word)) {
+      if (message.channel.id !== profanity.restricted.channelId) {
+        try {
+          await message.delete();
+          await message.channel.send(
+            `🔒 That word can only be used in <#${profanity.restricted.channelId}>, <@${message.author.id}>.`
+          );
+        } catch (err) {
+          console.error("Failed to enforce restricted word:", err);
+        }
+        return;
+      }
+    }
+  }
+  content = content.replace(/\s/g, "");
+  for (const word of profanity.mute) {
+  if (content.includes(word)) {
+    try {
+      await message.delete();
+      await message.channel.send(
+        `🚫 That word is not allowed, <@${message.author.id}>. You have been muted for 5 minutes.`
+      );
+
+      // Apply timeout (5 minutes = 300,000 ms)
+      const duration = 5 * 60 * 1000;
+      await message.member.timeout(duration, `Profanity mute for saying ${word}`);
+    } catch (err) {
+      console.error("Failed to timeout user:", err);
+    }
+    return; // stop further checks
+  }
+}
+  */
+ 
 
   // Only apply restriction if the user does NOT have ViewAuditLog permission
   if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
@@ -257,33 +524,35 @@ client.on("messageCreate", async (message) => {
   }
 
   // Countdown Commands
-  if (message.content.toLowerCase() === "?countdown" || message.content.toLowerCase() === "?farm") {
+  
+  if (message.content.toLowerCase() === "?countdown" || message.content.toLowerCase() === "?start") {
     const channelId = message.channel.id;
-
+  
     if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
       return message.reply("❌ Do not have the permission to start a farm");
     }
     if (!isFarmChannel(message.channel)) {
       return message.reply("⚠️ You can only start farm countdowns in #lord-farm-1 to #lord-farm-10");
     }
-
+  
     if (countdowns[channelId]) {
       return message.reply("⚠️ A farm is already active in this channel.");
     }
-
+  
     const now = Math.floor(Date.now() / 1000);
     const endTime = now + 3600;
     const authorId = message.author.id;
     const authorName = (authorId === "987401902234951790") ? "greener" : message.author.username;
-
+  
     countdowns[channelId] = {
       endTime,
       authorId,
       authorName,
-      startTime: now
+      startTime: now,
+      type: "single"
     };
     saveCountdowns();
-
+  
     const embed = new EmbedBuilder()
       .setColor(0xff0000)
       .setTitle("🕒 Game Countdown")
@@ -296,37 +565,106 @@ client.on("messageCreate", async (message) => {
         ].join("\n")
       )
       .setTimestamp();
-
+  
     const sentMsg = await message.reply({ embeds: [embed] });
-
+  
     countdownTimers[channelId] = setTimeout(() => {
       if (countdowns[channelId]) {
         endCountdown(channelId, client, sentMsg);
       }
     }, 3600000);
-
+  
     logAction(client, `⏳ Farm started in <#${channelId}> by **${authorName}**.`);
   }
+  
+  if (message.content.toLowerCase().startsWith("?cohost")) {
+    const channelId = message.channel.id;
+  
+    if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
+      return message.reply("❌ Do not have the permission to start a farm");
+    }
+    if (!isFarmChannel(message.channel)) {
+      return message.reply("⚠️ You can only start farms in #lord-farm-1 to #lord-farm-10");
+    }
+    if (countdowns[channelId]) {
+      return message.reply("⚠️ A farm is already active in this channel.");
+    }
+  
+    const cohostUser = message.mentions.users.first();
+    if (!cohostUser) {
+      return message.reply("⚠️ You must mention exactly **1 cohost**.");
+    }
+  
+    const now = Math.floor(Date.now() / 1000);
+    const endTime = now + 3600;
+  
+    countdowns[channelId] = {
+      endTime,
+      primaryId: message.author.id,
+      primaryName: message.author.username,
+      cohostId: cohostUser.id,
+      cohostName: cohostUser.username,
+      startTime: now,
+      type: "cohost"
+    };
+    saveCountdowns();
+  
+    const embed = new EmbedBuilder()
+      .setColor(0xff0000)
+      .setTitle("🕒 Cohost Game Countdown")
+      .setDescription(
+        [
+          `# **Game ends <t:${endTime}:R> (<t:${endTime}:t>)**`,
+          `# **Primary: ${message.author.username}**`,
+          `# **Cohost: ${cohostUser.username}**`,
+          `# **Each gets ~30 minutes**`,
+          `# **We are full. No more spots available.**`
+        ].join("\n")
+      )
+      .setTimestamp();
+  
+    const sentMsg = await message.reply({ embeds: [embed] });
+  
+    countdownTimers[channelId] = setTimeout(() => {
+      if (countdowns[channelId]) {
+        endCountdown(channelId, client, sentMsg);
+      }
+    }, 3600000);
+  
+    logAction(client, `⏳ Cohost farm started in <#${channelId}> by ${message.author.username} with ${cohostUser.username}.`);
+  }
+  
+  
+  
   if (message.content.toLowerCase() === "?status") {
     if (Object.keys(countdowns).length === 0) {
       return message.reply("✅ No active farms.");
     }
-
+  
     const embed = new EmbedBuilder()
       .setColor(0x00ff7f)
       .setTitle("⏳ Active farms")
       .setTimestamp();
-
+  
     for (const [channelId, data] of Object.entries(countdowns)) {
+      let nameLine;
+  
+      if (data.type === "cohost") {
+        nameLine = `${data.primaryName} + ${data.cohostName} - <#${channelId}>`;
+      } else {
+        nameLine = `${data.authorName}-<#${channelId}>`;
+      }
+  
       embed.addFields({
-        name: `${data.authorName}-<#${channelId}>`,
+        name: nameLine,
         value: `Ends <t:${data.endTime}:R> (<t:${data.endTime}:t>)`,
         inline: false
       });
     }
-
+  
     await message.reply({ embeds: [embed] });
   }
+  
   if (message.content.toLowerCase() === "?endcountdown" || message.content.toLowerCase() === "?end") {
     const channelId = message.channel.id;
     if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
@@ -346,6 +684,41 @@ client.on("messageCreate", async (message) => {
     if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
       return message.reply("❌ Only admins can reset the leaderboard.");
     }
+    const entries = Object.entries(hosters);
+    if (entries.length > 0) {
+      // Sort by total weekly time first, then by sessions
+      const sorted = entries.sort((a, b) => {
+        const ta = (a[1].week ?? 0);
+        const tb = (b[1].week ?? 0);
+        if (tb !== ta) return tb - ta;
+        return (b[1].weekCount ?? 0) - (a[1].weekCount ?? 0);
+      });
+  
+      // 🔹 Crown top host of the week before reset
+      const topHost = sorted[0];
+      const topHostId = topHost[0]; // userId directly since hosters keys are just IDs
+      const guild = message.guild;
+      const topRoleId = "1412723142941610078"; // replace with actual role ID
+      const member = await guild.members.fetch(topHostId).catch(() => null);
+  
+      if (member) {
+        const role = guild.roles.cache.get(topRoleId);
+        if (role) {
+          // remove role from anyone else who has it
+          for (const m of role.members.values()) {
+            if (m.id !== member.id) {
+              await m.roles.remove(role).catch(() => {});
+            }
+          }
+          // give role to current top host
+          if (!member.roles.cache.has(topRoleId)) {
+            await member.roles.add(topRoleId).catch(() => {});
+          }
+        }
+      }
+  
+      await message.channel.send(`👑 <@${topHostId}> has been crowned **Host of the Week**!`);
+    }
   
     for (const userId in hosters) {
       if (hosters[userId].week !== undefined) {
@@ -360,180 +733,206 @@ client.on("messageCreate", async (message) => {
     message.reply("✅ Weekly leaderboard has been reset.");
     logAction(client, `🗑️ Weekly leaderboard was reset by **${message.author.username}**.`);
   }
-  if (message.content.toLowerCase() === "?leaderboard" || message.content.toLowerCase() === "?lb") {
-    const entries = Object.entries(hosters);
-  
-    if (entries.length === 0) {
-      return message.reply("📉 No hosting data yet.");
-    }
-  
-    // Sort by total time DESC, then by count DESC
-    const sorted = entries.sort((a, b) => {
-      const ta = (a[1].time ?? 0);
-      const tb = (b[1].time ?? 0);
-      if (tb !== ta) return tb - ta;
-      return (b[1].count ?? 0) - (a[1].count ?? 0);
-    });
-  
-    // Split into pages (10 per page = safe for fields)
-    const perPage = 10;
-    const pages = [];
-    for (let i = 0; i < sorted.length; i += perPage) {
-      const chunk = sorted.slice(i, i + perPage);
-      let rank = i + 1;
-  
-      const embed = new EmbedBuilder()
-        .setColor(0xf1c40f)
-        .setTitle("🏆 Top Hosts Leaderboard")
-        .setDescription("Ranked by total hosted time.")
-        .setTimestamp();
-  
-      for (const [, data] of chunk) {
-        const minutes = data.time ?? 0;
-        const hours = Math.floor(minutes / 60);
-        const mins = minutes % 60;
-        const sessions = data.count ?? 0;
-  
-        embed.addFields({
-          name: `#${rank} — ${data.tag}`,
-          value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
-          inline: false,
-        });
-        rank++;
+    if (message.content.toLowerCase().startsWith("?leaderboard") || message.content.toLowerCase().startsWith("?lb")) {
+      const args = message.content.split(" ").slice(1); // get arguments
+      const entries = Object.entries(hosters);
+      const filterRank = args[0]?.toLowerCase();
+      if (entries.length === 0) {
+        return message.reply("📉 No hosting data yet.");
       }
-  
-      pages.push(embed);
-    }
-  
-    let pageIndex = 0;
-  
-    // Buttons
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("prev")
-        .setLabel("⬅️ Prev")
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId("next")
-        .setLabel("Next ➡️")
-        .setStyle(ButtonStyle.Primary)
-    );
-  
-    const reply = await message.reply({
-      embeds: [pages[pageIndex]],
-      components: pages.length > 1 ? [row] : [],
-    });
-  
-    if (pages.length <= 1) return;
-  
-    const collector = reply.createMessageComponentCollector({
-      filter: (i) => i.user.id === message.author.id,
-      time: 60_000, // 1 minute timeout
-    });
-  
-    collector.on("collect", async (interaction) => {
-      if (interaction.customId === "prev") {
-        pageIndex = (pageIndex - 1 + pages.length) % pages.length;
-      } else if (interaction.customId === "next") {
-        pageIndex = (pageIndex + 1) % pages.length;
+    
+    
+      // Determine which role we are filtering for (if any)
+      let filtered = entries;
+      if (["trial", "host", "vet"].includes(filterRank)) {
+        filtered = entries.filter(([id, data]) => data.rank === filterRank);
       }
-      await interaction.update({
-        embeds: [pages[pageIndex]],
-        components: [row],
+    
+      // Sort by total time DESC, then by count DESC
+      const sorted = filtered.sort((a, b) => {
+        const ta = (a[1].time ?? 0);
+        const tb = (b[1].time ?? 0);
+        if (tb !== ta) return tb - ta;
+        return (b[1].count ?? 0) - (a[1].count ?? 0);
       });
-    });
-  
-    collector.on("end", async () => {
-      await reply.edit({ components: [] }); // disable buttons after timeout
-    });
-  }
-  if (message.content.toLowerCase() === "?week") {
-    const entries = Object.entries(hosters);
-  
-    if (entries.length === 0) {
-      return message.reply("📉 No hosting data yet.");
-    }
-  
-    // Sort by total time DESC, then by count DESC
-    const sorted = entries.sort((a, b) => {
-      const ta = (a[1].week ?? 0);
-      const tb = (b[1].week ?? 0);
-      if (tb !== ta) return tb - ta;
-      return (b[1].count ?? 0) - (a[1].count ?? 0);
-    });
-  
-    // Split into pages (10 per page = safe for fields)
-    const perPage = 10;
-    const pages = [];
-    for (let i = 0; i < sorted.length; i += perPage) {
-      const chunk = sorted.slice(i, i + perPage);
-      let rank = i + 1;
-  
-      const embed = new EmbedBuilder()
-        .setColor(0xf1c40f)
-        .setTitle("🏆 Top Hosts Leaderboard")
-        .setDescription("Ranked by total hosted time.")
-        .setTimestamp();
-  
-      for (const [, data] of chunk) {
-        const minutes = data.week ?? 0;
-        const hours = Math.floor(minutes / 60);
-        const mins = minutes % 60;
-        const sessions = data.weekCount ?? 0;
-  
-        embed.addFields({
-          name: `#${rank} — ${data.tag}`,
-          value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
-          inline: false,
-        });
-        rank++;
+    
+      // Split into pages (10 per page = safe for fields)
+      const perPage = 10;
+      const pages = [];
+      for (let i = 0; i < sorted.length; i += perPage) {
+        const chunk = sorted.slice(i, i + perPage);
+        let rank = i + 1;
+    
+        const embed = new EmbedBuilder()
+          .setColor(0xf1c40f)
+          .setTitle("🏆 Top Hosts Leaderboard")
+          .setDescription(
+            filterRank 
+              ? `Ranked by total hosted time (${filterRank.toUpperCase()} only).`
+              : "Ranked by total hosted time."
+          )
+          .setTimestamp();
+    
+        for (const [, data] of chunk) {
+          const minutes = data.time ?? 0;
+          const hours = Math.floor(minutes / 60);
+          const mins = minutes % 60;
+          const sessions = data.count ?? 0;
+          const crowns = getCrowns(minutes);
+          embed.addFields({
+            name: `#${rank} — ${data.tag}${crowns}`,
+            value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
+            inline: false,
+          });
+          rank++;
+        }
+    
+        pages.push(embed);
       }
-  
-      pages.push(embed);
-    }
-  
-    let pageIndex = 0;
-  
-    // Buttons
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("prev")
-        .setLabel("⬅️ Prev")
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId("next")
-        .setLabel("Next ➡️")
-        .setStyle(ButtonStyle.Primary)
-    );
-  
-    const reply = await message.reply({
-      embeds: [pages[pageIndex]],
-      components: pages.length > 1 ? [row] : [],
-    });
-  
-    if (pages.length <= 1) return;
-  
-    const collector = reply.createMessageComponentCollector({
-      filter: (i) => i.user.id === message.author.id,
-      time: 60_000, // 1 minute timeout
-    });
-  
-    collector.on("collect", async (interaction) => {
-      if (interaction.customId === "prev") {
-        pageIndex = (pageIndex - 1 + pages.length) % pages.length;
-      } else if (interaction.customId === "next") {
-        pageIndex = (pageIndex + 1) % pages.length;
-      }
-      await interaction.update({
+    
+      let pageIndex = 0;
+    
+      // Buttons
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("prev")
+          .setLabel("⬅️ Prev")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("next")
+          .setLabel("Next ➡️")
+          .setStyle(ButtonStyle.Primary)
+      );
+    
+      const reply = await message.reply({
         embeds: [pages[pageIndex]],
-        components: [row],
+        components: pages.length > 1 ? [row] : [],
       });
-    });
-  
-    collector.on("end", async () => {
-      await reply.edit({ components: [] }); // disable buttons after timeout
-    });
-  }
+    
+      if (pages.length <= 1) return;
+    
+      const collector = reply.createMessageComponentCollector({
+        filter: (i) => i.user.id === message.author.id,
+        time: 60_000, // 1 minute timeout
+      });
+    
+      collector.on("collect", async (interaction) => {
+        if (interaction.customId === "prev") {
+          pageIndex = (pageIndex - 1 + pages.length) % pages.length;
+        } else if (interaction.customId === "next") {
+          pageIndex = (pageIndex + 1) % pages.length;
+        }
+        await interaction.update({
+          embeds: [pages[pageIndex]],
+          components: [row],
+        });
+      });
+    
+      collector.on("end", async () => {
+        await reply.edit({ components: [] }); // disable buttons after timeout
+      });
+    }
+    
+    if (message.content.toLowerCase().startsWith("?week")) {
+      const args = message.content.split(" ").slice(1); // get arguments
+      const entries = Object.entries(hosters);
+      const filterRank = args[0]?.toLowerCase();
+      if (entries.length === 0) {
+        return message.reply("📉 No hosting data yet.");
+      }
+    
+    
+      // Determine which role we are filtering for (if any)
+      let filtered = entries;
+      if (["trial", "host", "vet"].includes(filterRank)) {
+        filtered = entries.filter(([id, data]) => data.rank === filterRank);
+      }
+    
+      // Sort by total time DESC, then by count DESC
+      const sorted = entries.sort((a, b) => {
+        const ta = (a[1].week ?? 0);
+        const tb = (b[1].week ?? 0);
+        if (tb !== ta) return tb - ta;
+        return (b[1].count ?? 0) - (a[1].count ?? 0);
+      });
+    
+      // Split into pages (10 per page = safe for fields)
+      const perPage = 10;
+      const pages = [];
+      for (let i = 0; i < sorted.length; i += perPage) {
+        const chunk = sorted.slice(i, i + perPage);
+        let rank = i + 1;
+    
+        const embed = new EmbedBuilder()
+          .setColor(0xf1c40f)
+          .setTitle("🏆 Top Hosts Leaderboard")
+          .setDescription(
+            filterRank 
+              ? `Ranked by total hosted time (${filterRank.toUpperCase()} only).`
+              : "Ranked by total hosted time."
+          )
+          .setTimestamp();
+    
+        for (const [, data] of chunk) {
+          const minutes = data.time ?? 0;
+          const hours = Math.floor(minutes / 60);
+          const mins = minutes % 60;
+          const sessions = data.count ?? 0;
+          const crowns = getCrowns(minutes);
+          embed.addFields({
+            name: `#${rank} — ${data.tag}${crowns}`,
+            value: `⏱️ **${hours}h ${mins}m** total\n🎮 **${sessions}** sessions`,
+            inline: false,
+          });
+          rank++;
+        }
+    
+        pages.push(embed);
+      }
+    
+      let pageIndex = 0;
+    
+      // Buttons
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("prev")
+          .setLabel("⬅️ Prev")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("next")
+          .setLabel("Next ➡️")
+          .setStyle(ButtonStyle.Primary)
+      );
+    
+      const reply = await message.reply({
+        embeds: [pages[pageIndex]],
+        components: pages.length > 1 ? [row] : [],
+      });
+    
+      if (pages.length <= 1) return;
+    
+      const collector = reply.createMessageComponentCollector({
+        filter: (i) => i.user.id === message.author.id,
+        time: 60_000, // 1 minute timeout
+      });
+    
+      collector.on("collect", async (interaction) => {
+        if (interaction.customId === "prev") {
+          pageIndex = (pageIndex - 1 + pages.length) % pages.length;
+        } else if (interaction.customId === "next") {
+          pageIndex = (pageIndex + 1) % pages.length;
+        }
+        await interaction.update({
+          embeds: [pages[pageIndex]],
+          components: [row],
+        });
+      });
+    
+      collector.on("end", async () => {
+        await reply.edit({ components: [] }); // disable buttons after timeout
+      });
+    }
+ 
   
   // Money Commands
   // add money (admin only)
@@ -653,102 +1052,6 @@ client.on("messageCreate", async (message) => {
     await message.delete().catch(() => {});
   }
 
-  
-
-  // Session commands
-  if (message.content.toLowerCase() === "?session") {
-    const userId = message.author.id;
-  
-    if (sessions[userId]) {
-      return message.reply("⚠️ You already have an active session. Use `!endsession` first.");
-    }
-  
-    const start = Math.floor(Date.now() / 1000);
-  
-    sessions[userId] = {
-      startTime: start,
-      authorName: message.author.username,
-    };
-    saveSessions();
-  
-    const embed = new EmbedBuilder()
-      .setColor(0x2ecc71)
-      .setTitle("🟢 Session Started")
-      .setDescription(
-        `Session started at <t:${start}:t>\n` +
-        `Started by: **${message.author.username}**`
-      )
-      .setTimestamp();
-  
-    await message.reply({ embeds: [embed] });
-  }
-
-  if (message.content.toLowerCase() === "?endsession") {
-    const userId = message.author.id;
-  
-    if (!sessions[userId]) {
-      return message.reply("⚠️ You don't have an active session to end.");
-    }
-  
-    const session = sessions[userId];
-    const end = Math.floor(Date.now() / 1000);
-    const elapsedSeconds = end - session.startTime;
-    const elapsedMinutes = Math.floor(elapsedSeconds / 60);
-  
-    // Update session leaderboard
-    if (!sessionHosters[userId]) {
-      sessionHosters[userId] = { tag: session.authorName, count: 0, time: 0 };
-    }
-    sessionHosters[userId].count += 1;
-    sessionHosters[userId].time += elapsedMinutes;
-    saveSessionHosters();
-  
-    delete sessions[userId];
-    saveSessions();
-  
-    const embed = new EmbedBuilder()
-      .setColor(0xe74c3c)
-      .setTitle("🔴 Session Ended")
-      .setDescription(
-        `Started by: **${session.authorName}**\n` +
-        `Duration: **${elapsedMinutes} minutes**\n` +
-        `Total Time: ${Math.floor(sessionHosters[userId].time / 60)}h ${sessionHosters[userId].time % 60}m`
-      )
-      .setTimestamp();
-  
-    await message.reply({ embeds: [embed] });
-  }
-
-  if (message.content.toLowerCase() === "?sessionlb") {
-    if (Object.keys(sessionHosters).length === 0) {
-      return message.reply("📊 No session data found yet.");
-    }
-  
-    // Sort by total time (descending)
-    const sorted = Object.entries(sessionHosters)
-      .sort(([, a], [, b]) => b.time - a.time)
-      .slice(0, 10);
-  
-    const embed = new EmbedBuilder()
-      .setColor(0x9b59b6)
-      .setTitle("🏆 Session Leaderboard")
-      .setDescription("Top session hosts by total time:")
-      .setTimestamp();
-  
-    sorted.forEach(([userId, data], index) => {
-      embed.addFields({
-        name: `#${index + 1} ${data.tag}`,
-        value: `Sessions: **${data.count}** | Time: **${Math.floor(data.time / 60)}h ${data.time % 60}m**`,
-        inline: false,
-      });
-    });
-  
-    await message.reply({ embeds: [embed] });
-  }
-  
-  
-
-
   //  Non core commands
   // !help command
   if (message.content.toLowerCase() === "?help") {
@@ -785,7 +1088,7 @@ client.on("messageCreate", async (message) => {
   if (message.content.toLowerCase() === '?sybau') {
     message.reply("https://tenor.com/view/sybau-ts-pmo-gif-2102579015947246168")
   }
-  if (message.content.toLowerCase().startsWith("!addtime")) {
+  if (message.content.toLowerCase().startsWith("?addtime")) {
     if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog) && message.author.id != "1029305942313021520") {
       return message.reply("❌ Only mods/Dirac can add time.");
     }
@@ -801,7 +1104,7 @@ client.on("messageCreate", async (message) => {
     if (!target) {
       return message.reply("⚠️ Please mention a valid user.");
     }
-    if (isNaN(minutes) || minutes <= 0) {
+    if (isNaN(minutes)) {
       return message.reply("⚠️ Please provide a valid positive number of minutes.");
     }
   
@@ -828,13 +1131,15 @@ client.on("messageCreate", async (message) => {
 
     
   }
-  if (message.content.toLowerCase() === "!slapshadow"){
+  if (message.content.toLowerCase() === "?slapshadow"){
     message.reply("https://images-ext-1.discordapp.net/external/3vm4CyZKFYQBYn0rHq3venph0yjW57PgehvvSK1sWmM/https/media.tenor.com/Z7GWN6L9GzwAAAPo/powerslap-slap-ko.mp4")
   }
+   
+  
 
   // Lord Banning
   // ── !lordban @user <days> <reason> ────────────────────────────────────────────
-if (message.content.toLowerCase().startsWith("!lordban")) {
+if (message.content.toLowerCase().startsWith("?lordban")) {
   // Permissions: require ManageRoles
   if (!message.member.permissions.has(PermissionsBitField.Flags.ManageNicknames)) {
     return message.reply("❌ You need to be a host to use this.");
@@ -937,7 +1242,7 @@ if (message.content.toLowerCase().startsWith("!lordban")) {
   }
 }
 
-if (message.content.toLowerCase().startsWith("!reduceban")) {
+if (message.content.toLowerCase().startsWith("?reduceban")) {
   const args = message.content.trim().split(/ +/).slice(1);
   const target = message.mentions.users.first();
   if (!target) {
@@ -1007,7 +1312,7 @@ if (message.content.toLowerCase().startsWith("!reduceban")) {
 
   fs.writeFileSync(warnsFile, JSON.stringify(warns, null, 2));
 }
-if (message.content.toLowerCase().startsWith("!history")) {
+if (message.content.toLowerCase().startsWith("?history")) {
   const args = message.content.trim().split(/ +/).slice(1);
   const target = message.mentions.users.first();
 
@@ -1068,7 +1373,7 @@ if (message.content.toLowerCase().startsWith("!history")) {
   return message.channel.send({ embeds: [embed] });
 }
 
-if (message.content.toLowerCase().startsWith("!scrub")) {
+if (message.content.toLowerCase().startsWith("?scrub")) {
   // Permission check
   if (!message.member.permissions.has("ViewAuditLog")) {
     return message.reply("❌ You don’t have permission to use this command.");
@@ -1107,64 +1412,614 @@ if (message.content.toLowerCase().startsWith("!scrub")) {
   }
 }
 
+// Supporter Roles
+if (message.content.toLowerCase().startsWith("?addcustomrole")) {
+  if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    return message.reply("❌ You don’t have permission to manage roles.");
+  }
+
+  const args = message.content.trim().split(/\s+/).slice(1);
+  const target = message.mentions.members.first();
+  const role = message.mentions.roles.first();
+  const days = parseFloat(args[2]);
+
+  if (!target) return message.reply("⚠️ Please mention a user.");
+  if (!role) return message.reply("⚠️ Please mention a role.");
+  if (isNaN(days) || days <= 0) return message.reply("⚠️ Please provide a valid number of days.");
+
+  try {
+    await target.roles.add(role, `Temporary custom role for ${days} days`);
+    const endAt = Date.now() + days * 24 * 60 * 60 * 1000;
+
+    const key = `${message.guild.id}:${target.id}:${role.id}`;
+    customRoles[key] = {
+      guildId: message.guild.id,
+      userId: target.id,
+      roleId: role.id,
+      endAt
+    };
+    saveCustomRoles();
+
+    message.reply(`✅ Added role ${role} to ${target} for ${days} days.`);
+  } catch (err) {
+    console.error(err);
+    message.reply("❌ Failed to assign role.");
+  }
+}
+
+// --- Custom Commands ---
+
+// CREATE
+if (message.content.toLowerCase().startsWith("!create ")) {
+  const args = message.content.split(" ").slice(1); // remove "!create"
+  const name = args.shift()?.toLowerCase();
+  const response = args.join(" ");
+
+  if (!message.member.permissions.has(PermissionsBitField.Flags.ChangeNickname)) {
+    return message.reply("❌ You don’t have permission to create custom commands.");
+  }
+  if (!name || !response) {
+    return message.reply("Usage: `!create <name> <response>`");
+  }
+
+  // prevent collisions with built-ins or reserved names
+  if (validCommands.includes("?" + name) || ["!create", "!edit", "!delete"].includes("!" + name)) {
+    return message.reply("❌ That command name is reserved.");
+  }
+
+  // prevent duplicates
+  if (customs[name]) {
+    return message.reply("❌ That command already exists.");
+  }
+
+  // save with owner tracking
+  customs[name] = { response, owner: message.author.id };
+  saveCustoms();
+
+  return message.reply(`✅ Custom command \`!${name}\` created.`);
+}
+
+// EDIT
+if (message.content.toLowerCase().startsWith("!edit ")) {
+  const args = message.content.split(" ").slice(1);
+  const name = args.shift()?.toLowerCase();
+  const newResponse = args.join(" ");
+
+  if (!name || !newResponse) {
+    return message.reply("Usage: `!edit <name> <new response>`");
+  }
+  if (!customs[name]) {
+    return message.reply("❌ That command doesn’t exist.");
+  }
+
+  // permission check
+  if (
+    customs[name].owner !== message.author.id &&
+    !message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)
+  ) {
+    return message.reply("❌ You can only edit your own commands.");
+  }
+
+  customs[name].response = newResponse;
+  saveCustoms();
+  return message.reply(`✏️ Command \`!${name}\` updated.`);
+}
+// LIST
+if (message.content.toLowerCase() === "!listcommands") {
+  const entries = Object.entries(customs);
+
+  if (entries.length === 0) {
+    return message.reply("📭 No custom commands have been created yet.");
+  }
+
+  const lines = entries.map(([name, data]) => {
+    const owner = `<@${data.owner}>`; // mention the owner
+    return `\`!${name}\` → ${data.response} (by ${owner})`;
+  });
+
+  return message.channel.send("📝 **Custom Commands:**\n" + lines.join("\n"));
+}
+
+
+// DELETE
+if (message.content.toLowerCase().startsWith("!delete ")) {
+  const args = message.content.split(" ").slice(1);
+  const name = args.shift()?.toLowerCase();
+
+  if (!name) {
+    return message.reply("Usage: `!delete <name>`");
+  }
+  if (!customs[name]) {
+    return message.reply("❌ That command doesn’t exist.");
+  }
+
+  if (!message.member.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+    return message.reply("❌ Only moderators with **View Audit Log** can delete commands.");
+  }
+
+  delete customs[name];
+  saveCustoms();
+  return message.reply(`🗑️ Command \`!${name}\` deleted.`);
+}
+
+
+if (message.content.toLowerCase().startsWith("!tasklist")) {
+  const tasks = loadTasks();
+  const args = message.content.split(" ").slice(1);
+
+  let targetUser = message.mentions.users.first();
+  let embed = new EmbedBuilder().setColor("Blue").setTitle("📝 Task List");
+
+  // If regular moderator -> only see own tasks
+  if (!isTaskManager(message.member)) {
+    const userTasks = tasks[message.author.id]?.tasks || [];
+    if (userTasks.length === 0) {
+      return message.reply("✅ You have no tasks assigned.");
+    }
+    let desc = userTasks
+      .map((t, i) => `**${i + 1}.** ${t.description} ${t.completed ? "✅" : "❌"}`)
+      .join("\n");
+    embed.setDescription(desc);
+    return message.reply({ embeds: [embed] });
+  }
+
+  // If task manager and @user provided
+  if (targetUser) {
+    const userTasks = tasks[targetUser.id]?.tasks || [];
+    if (userTasks.length === 0) {
+      return message.reply(`✅ ${targetUser.username} has no tasks assigned.`);
+    }
+    let desc = userTasks
+      .map((t, i) => `**${i + 1}.** ${t.description} ${t.completed ? "✅" : "❌"}`)
+      .join("\n");
+    embed.setTitle(`📝 Tasks for ${targetUser.username}`).setDescription(desc);
+    return message.reply({ embeds: [embed] });
+  }
+
+  // If task manager and no args -> show all users
+  let allDesc = "";
+  for (const [userId, data] of Object.entries(tasks)) {
+    if (!data.tasks || data.tasks.length === 0) continue;
+    const user = await message.guild.members.fetch(userId).catch(() => null);
+    const name = user ? user.user.username : `Unknown (${userId})`;
+    const taskLines = data.tasks
+      .map((t, i) => `**${i + 1}.** ${t.description} ${t.completed ? "✅" : "❌"}`)
+      .join("\n");
+    allDesc += `**${name}**\n${taskLines}\n\n`;
+  }
+
+  if (allDesc === "") {
+    return message.reply("✅ No tasks assigned to anyone.");
+  }
+
+  embed.setDescription(allDesc);
+  return message.reply({ embeds: [embed] });
+}
+if (message.content.toLowerCase().startsWith("!addtask")) {
+  const tasks = loadTasks();
+  const args = message.content.split(" ").slice(1);
+  const targetUser = message.mentions.users.first();
+
+  // If task manager assigning to someone else
+  if (isTaskManager(message.member) && targetUser) {
+    const description = args.slice(1).join(" ");
+    if (!description) {
+      return message.reply("❌ Please provide a task description.");
+    }
+
+    if (!tasks[targetUser.id]) tasks[targetUser.id] = { tasks: [] };
+    tasks[targetUser.id].tasks.push({ description, completed: false });
+    saveTasks(tasks);
+
+    message.reply(`✅ Task added for ${targetUser.username}.`);
+
+    const embed = new EmbedBuilder()
+      .setColor("Green")
+      .setTitle("📌 Task Assigned")
+      .setDescription(
+        `**Assigned by:** ${message.author}\n**To:** ${targetUser}\n**Task:** ${description}`
+      )
+      .setTimestamp();
+
+    logTransaction(client, embed);
+
+    // DM the target user
+    targetUser.send(
+      `📌 You have been assigned a new task by ${message.author}:\n**${description}**`
+    ).catch(() => {
+      message.reply("⚠️ Could not DM the user their task.");
+    });
+
+    return;
+  }
+
+  // If regular moderator → can only assign to themselves
+  if (!isTaskManager(message.member)) {
+    const description = args.join(" ");
+    if (!description) {
+      return message.reply("❌ Please provide a task description.");
+    }
+
+    if (!tasks[message.author.id]) tasks[message.author.id] = { tasks: [] };
+    tasks[message.author.id].tasks.push({ description, completed: false });
+    saveTasks(tasks);
+
+    message.reply(`✅ Task added for yourself.`);
+
+    const embed = new EmbedBuilder()
+      .setColor("Green")
+      .setTitle("📌 Task Added (Self)")
+      .setDescription(
+        `**Moderator:** ${message.author}\n**Task:** ${description}`
+      )
+      .setTimestamp();
+
+    logTransaction(client, embed);
+
+    // DM the author their task
+    message.author.send(
+      `📌 You added a new task for yourself:\n**${description}**`
+    ).catch(() => {
+      message.reply("⚠️ Could not DM you your task.");
+    });
+
+    return;
+  }
+
+  // If task manager but forgot to mention user
+  if (isTaskManager(message.member) && !targetUser) {
+    return message.reply("❌ Please mention a user to assign a task to.");
+  }
+}
+
+if (message.content.toLowerCase().startsWith("!removetask")) {
+  const tasks = loadTasks();
+  const args = message.content.split(" ").slice(1);
+  const targetUser = message.mentions.users.first();
+
+  // If a task manager is removing someone else's task
+  if (isTaskManager(message.member) && targetUser) {
+    const number = parseInt(args[1]);
+    if (isNaN(number)) {
+      return message.reply("❌ Please provide a valid task number.");
+    }
+
+    const userTasks = tasks[targetUser.id]?.tasks || [];
+    if (number < 1 || number > userTasks.length) {
+      return message.reply("❌ Invalid task number.");
+    }
+
+    const removedTask = userTasks.splice(number - 1, 1)[0];
+    tasks[targetUser.id].tasks = userTasks;
+    saveTasks(tasks);
+
+    message.reply(`✅ Removed task **#${number}** from ${targetUser.username}.`);
+
+    const embed = new EmbedBuilder()
+      .setColor("Red")
+      .setTitle("🗑️ Task Removed")
+      .setDescription(
+        `**Removed by:** ${message.author}\n**From:** ${targetUser}\n**Task:** ${removedTask.description}`
+      )
+      .setTimestamp();
+
+    logTransaction(client, embed);
+    return;
+  }
+
+  // If regular moderator removing their own task
+  if (!isTaskManager(message.member)) {
+    const number = parseInt(args[0]);
+    if (isNaN(number)) {
+      return message.reply("❌ Please provide a valid task number.");
+    }
+
+    const userTasks = tasks[message.author.id]?.tasks || [];
+    if (number < 1 || number > userTasks.length) {
+      return message.reply("❌ Invalid task number.");
+    }
+
+    const removedTask = userTasks.splice(number - 1, 1)[0];
+    tasks[message.author.id].tasks = userTasks;
+    saveTasks(tasks);
+
+    message.reply(`✅ Removed task **#${number}** from yourself.`);
+
+    const embed = new EmbedBuilder()
+      .setColor("Red")
+      .setTitle("🗑️ Task Removed (Self)")
+      .setDescription(
+        `**Moderator:** ${message.author}\n**Task:** ${removedTask.description}`
+      )
+      .setTimestamp();
+
+    logTransaction(client, embed);
+    return;
+  }
+
+  // If manager forgot to mention user
+  if (isTaskManager(message.member) && !targetUser) {
+    return message.reply("❌ Please mention a user whose task you want to remove.");
+  }
+}
+if (message.content.toLowerCase().startsWith("!completetask")) {
+  const tasks = loadTasks();
+  const args = message.content.split(" ").slice(1);
+  const number = parseInt(args[0]);
+
+  if (isNaN(number)) {
+    return message.reply("❌ Please provide a valid task number.");
+  }
+
+  const userTasks = tasks[message.author.id]?.tasks || [];
+  if (number < 1 || number > userTasks.length) {
+    return message.reply("❌ Invalid task number.");
+  }
+
+  const task = userTasks[number - 1];
+
+  // Remove the completed task from the list
+  userTasks.splice(number - 1, 1);
+  tasks[message.author.id].tasks = userTasks;
+  saveTasks(tasks);
+
+  message.reply(`✅ Completed and removed task **#${number}**: **${task.description}**`);
+
+  const embed = new EmbedBuilder()
+    .setColor("Green")
+    .setTitle("✅ Task Completed")
+    .setDescription(
+      `**Moderator:** ${message.author}\n**Task:** ${task.description}`
+    )
+    .setTimestamp();
+
+  logTransaction(client, embed);
+}
+
+if (message.content.toLowerCase().startsWith("!remindtask")) {
+  if (!isTaskManager(message.member)) {
+    return message.reply("❌ You don’t have permission to use this.");
+  }
+
+  const targetUser = message.mentions.users.first();
+  if (!targetUser) {
+    return message.reply("❌ Please mention a user to remind.");
+  }
+
+  await sendTaskReminder(client, targetUser.id);
+  message.reply(`✅ Sent a reminder to ${targetUser.username}.`);
+}
+
+
+
+
+
+
+// EXECUTION
+const cmdName = message.content.toLowerCase().slice(1).split(" ")[0];
+if (customs[cmdName]) {
+  return message.channel.send(customs[cmdName].response);
+}
+
 
 
 
 
 
 });
+// Keep track of flagged VCs and host counts
+const flaggedChannels = new Map(); // channelId -> last logged host count
+
+client.on("voiceStateUpdate", async (oldState, newState) => {
+  try {
+    const LORD_FARM_CHANNELS = [
+      "1414174879674142730",
+      "1414175991890317383",
+    ];
+
+    const HOST_ROLES = [
+      "1414176244072976486",
+      "1414176412407042099",
+    ];
+
+    const newChannel = newState.channel;
+    const oldChannel = oldState.channel;
+
+    // Only check if user joined or moved channels
+    if (newChannel === oldChannel) return;
+    if (!newChannel || !LORD_FARM_CHANNELS.includes(newChannel.id)) return;
+
+    // Collect members with host roles (exclude mods/admins and "filling")
+    const hostsInVC = newChannel.members.filter((member) => {
+      const hasHostRole = HOST_ROLES.some((roleId) =>
+        member.roles.cache.has(roleId)
+      );
+      const isAdmin = member.permissions.has(
+        PermissionsBitField.Flags.ViewAuditLog
+      );
+      const isFilling =
+        (member.nickname && member.nickname.toLowerCase().includes("fill")) ||
+        member.user.username.toLowerCase().includes("fill");
+
+      return hasHostRole && !isAdmin && !isFilling;
+    });
+
+    const hostCount = hostsInVC.size;
+
+    if (hostCount > 2) {
+      const lastLoggedCount = flaggedChannels.get(newChannel.id) || 0;
+
+      if (hostCount > lastLoggedCount) {
+        // Only log when host count increases beyond last logged value
+        const hostNames = hostsInVC.map((m) => m.user.tag).join(", ");
+        const msg =
+          `⚠️ Too many hosts detected in <#${newChannel.id}>!\n` +
+          `Currently: **${hostCount}**\n` +
+          `👥 Hosts: ${hostNames}`;
+        logAction(client, msg);
+
+        flaggedChannels.set(newChannel.id, hostCount);
+      }
+    } else {
+      // If safe again, clear from flaggedChannels
+      if (flaggedChannels.has(newChannel.id)) {
+        flaggedChannels.delete(newChannel.id);
+      }
+    }
+  } catch (err) {
+    console.error("Error in voiceStateUpdate check:", err);
+  }
+});
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === 'link') {
+    const link = interaction.options.getString('url');
+
+    // delete the ephemeral reply so user’s slash command isn’t shown
+    await interaction.deferReply({ ephemeral: true });
+    await interaction.deleteReply().catch(() => {});
+
+    // send the link to the channel
+    await interaction.channel.send(link);
+  }
+});
+async function backfillRanks(client, guildId) {
+  const guild = await client.guilds.fetch(guildId);
+
+  for (const userId of Object.keys(hosters)) {
+    if (!hosters[userId].rank) {
+      try {
+        const member = await guild.members.fetch(userId);
+        if (member) {
+          if (member.roles.cache.has(ROLE_IDS.vet)) hosters[userId].rank = "vet";
+          else if (member.roles.cache.has(ROLE_IDS.host)) hosters[userId].rank = "host";
+          else if (member.roles.cache.has(ROLE_IDS.trial)) hosters[userId].rank = "trial";
+          else hosters[userId].rank = null;
+        }
+      } catch {
+        hosters[userId].rank = null; // user left guild etc.
+      }
+    }
+  }
+
+  saveHosters();
+  console.log("✅ Ranks backfilled.");
+}
+
 
 // Helper: end countdown
 async function endCountdown(channelId, client, triggerMsg) {
+  const guild = client.guilds.cache.get("1408612024870764607");
   const countdown = countdowns[channelId];
   if (!countdown) return;
+  const ROLE_FILTERS = {
+    trial: "1417969865058418738", // trial role ID
+    host: "1414176244072976486",  // host role ID
+    vet: "1414176412407042099",   // veteran role ID
+  };
+
+  function getRank(member) {
+    if (!member) return null;
+    if (member.roles.cache.has(ROLE_FILTERS.vet)) return "vet";
+    if (member.roles.cache.has(ROLE_FILTERS.host)) return "host";
+    if (member.roles.cache.has(ROLE_FILTERS.trial)) return "trial";
+    return null;
+  }
 
   if (countdownTimers[channelId]) {
     clearTimeout(countdownTimers[channelId]);
     delete countdownTimers[channelId];
   }
-  
+
   const elapsedSeconds = Math.floor(Date.now() / 1000) - countdown.startTime;
   const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  const split = Math.floor(elapsedMinutes / 2);
 
-  // Update leaderboard
-  if (!hosters[countdown.authorId]) {
-    hosters[countdown.authorId] = { tag: countdown.authorName, count: 0, time: 0, week: 0, weekCount: 0 };
+  async function ensureHoster(userId, userName) {
+    if (!hosters[userId]) {
+      hosters[userId] = { tag: userName, count: 0, time: 0, week: 0, weekCount: 0, rank:"" };
+    }
+    if (!hosters[userId].rank) {
+      try {
+         // assumes you stored guildId in countdown
+        if (guild) {
+          const member = await guild.members.fetch(userId).catch(() => null);
+          if (member) {
+            hosters[userId].rank = getRank(member);
+          }
+        }
+      } catch (err) {
+        hosters[userId].rank = null;
+      }
+    }
   }
-  hosters[countdown.authorId].count += 1;
-  hosters[countdown.authorId].time += elapsedMinutes;
-  hosters[countdown.authorId].weekCount += 1;
-  hosters[countdown.authorId].week += elapsedMinutes;
-  saveHosters();
 
-  // Delete countdown
+  if (countdown.type === "cohost") {
+    // primary
+    await ensureHoster(countdown.primaryId, countdown.primaryName);
+    hosters[countdown.primaryId].count += 1;
+    hosters[countdown.primaryId].time += split;
+    hosters[countdown.primaryId].weekCount += 1;
+    hosters[countdown.primaryId].week += split;
+    const member = await guild.members.fetch(countdown.primaryId).catch(() => null);
+    hosters[countdown.primaryId].rank = getRank(member);
+
+    // cohost
+    await ensureHoster(countdown.cohostId, countdown.cohostName);
+    hosters[countdown.cohostId].count += 1;
+    hosters[countdown.cohostId].time += split;
+    hosters[countdown.cohostId].weekCount += 1;
+    hosters[countdown.cohostId].week += split;
+    const comember = await guild.members.fetch(countdown.cohostId).catch(() => null);
+    hosters[countdown.cohostId].rank = getRank(comember);
+
+  } else {
+    // single host
+    await ensureHoster(countdown.authorId, countdown.authorName);
+    hosters[countdown.authorId].count += 1;
+    hosters[countdown.authorId].time += elapsedMinutes;
+    hosters[countdown.authorId].weekCount += 1;
+    hosters[countdown.authorId].week += elapsedMinutes;
+    const member = await guild.members.fetch(countdown.authorId).catch(() => null);
+    hosters[countdown.authorId].rank = getRank(member);
+  }
+
+  saveHosters();
   delete countdowns[channelId];
   saveCountdowns();
 
   const redFlag = elapsedMinutes < 5 ? " 🚩" : "";
-  const embedColor = elapsedMinutes < 5 ? 0xff0000 : 0x00FF00; // red if flagged, orange otherwise
+  const embedColor = elapsedMinutes < 5 ? 0xff0000 : 0x00FF00;
 
-  // Build embed log
   const logEmbed = new EmbedBuilder()
     .setColor(embedColor)
     .setTitle("⏹️ Farm ended")
     .setDescription(
-      `Channel: <#${channelId}>\n` +
-      `Host: **${countdown.authorName}**\n` +
-      `Duration: **${elapsedMinutes} minutes**${redFlag}\n` +
-      `Total Time: ${Math.floor(hosters[countdown.authorId].time / 60)}h ${hosters[countdown.authorId].time % 60}m`
+      countdown.type === "cohost"
+        ? `Channel: <#${channelId}>\n` +
+          `Primary: **${countdown.primaryName}**\n` +
+          `Cohost: **${countdown.cohostName}**\n` +
+          `Duration: **${elapsedMinutes} minutes** total\n` +
+          `Each got: **${split} minutes**${redFlag}`
+        : `Channel: <#${channelId}>\nHost: **${countdown.authorName}**\n` +
+          `Duration: **${elapsedMinutes} minutes**${redFlag}\n` +
+          `Total Time: ${Math.floor(hosters[countdown.authorId].time / 60)}h ${hosters[countdown.authorId].time % 60}m`
     )
     .setTimestamp();
 
-  // Send to logging channel
   const logChannel = client.channels.cache.get("1408696241461661796");
   if (logChannel) await logChannel.send({ embeds: [logEmbed] });
 
   if (triggerMsg.reply) {
-    replyChannel = client.channels.cache.get(channelId);
+    const replyChannel = client.channels.cache.get(channelId);
     await replyChannel.send(`⏹️ Farm ended. Hosted for ${elapsedMinutes} minutes.`);
   }
 }
+
+
+
+
 
 // Login
 client.login(token);
